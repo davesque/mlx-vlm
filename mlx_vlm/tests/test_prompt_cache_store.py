@@ -65,7 +65,7 @@ class TestPromptCacheStore:
         store.put(ranges, tokens, cache)
         result = store.get(ranges, tokens)
         assert result is not None
-        _, num_cached = result
+        _, _, num_cached = result
         assert num_cached == 50
 
     def test_multi_message_lookup(self):
@@ -78,7 +78,7 @@ class TestPromptCacheStore:
         # Look up same 3 messages: should hit at message 3
         result = store.get(ranges, tokens)
         assert result is not None
-        _, num_cached = result
+        _, _, num_cached = result
         assert num_cached == 60
 
     def test_prefix_hit_on_extended_conversation(self):
@@ -93,7 +93,7 @@ class TestPromptCacheStore:
         ranges_3 = [(0, 20), (20, 50), (50, 60)]
         result = store.get(ranges_3, tokens_3)
         assert result is not None
-        _, num_cached = result
+        _, _, num_cached = result
         assert num_cached == 50  # cached up to message 2
 
     def test_shared_system_prompt(self):
@@ -112,7 +112,7 @@ class TestPromptCacheStore:
         tokens_b = sys_tokens + user_b_tokens
         result = store.get(ranges_b, tokens_b)
         assert result is not None
-        _, num_cached = result
+        _, _, num_cached = result
         # Should hit at system prompt boundary (message 1), not message 2
         assert num_cached == 100
 
@@ -154,7 +154,7 @@ class TestCacheReconstruction:
         store.put(ranges, tokens, cache)
         result = store.get(ranges, tokens)
         assert result is not None
-        layer_states, n_tokens = result
+        _, layer_states, n_tokens = result
 
         reconstructed = store.reconstruct_cache(layer_states)
         assert len(reconstructed) == 2
@@ -172,7 +172,7 @@ class TestCacheReconstruction:
 
         store.put(ranges, tokens, cache)
         result = store.get(ranges, tokens)
-        layer_states, _ = result
+        _, layer_states, _ = result
 
         reconstructed = store.reconstruct_cache(layer_states, trim_to=50)
         for rc in reconstructed:
@@ -197,7 +197,7 @@ class TestDiskPersistence:
 
             result = store2.get(ranges, tokens)
             assert result is not None
-            _, n_tokens = result
+            _, _, n_tokens = result
             assert n_tokens == 50
 
     def test_save_empty_store(self):

@@ -1167,16 +1167,13 @@ async def chat_completions_endpoint(request: ChatRequest):
             stream_cache_store = get_prompt_cache_store(request.model)
             stream_cached = stream_cache_store.get(stream_msg_ranges, stream_all_tokens)
             if stream_cached is not None:
-                layer_states, num_cached_tokens = stream_cached
-                prompt_cache = stream_cache_store.reconstruct_cache(
-                    layer_states, trim_to=num_cached_tokens
-                )
-                generation_kwargs["prompt_cache"] = prompt_cache
-                logger.info(
-                    "Cache hit (stream): %d/%d tokens cached, prefilling %d remaining",
-                    num_cached_tokens, len(stream_prompt_token_ids),
-                    len(stream_prompt_token_ids) - num_cached_tokens,
-                )
+                live_cache, layer_states, num_cached_tokens = stream_cached
+                if live_cache is not None:
+                    generation_kwargs["prompt_cache"] = live_cache
+                else:
+                    generation_kwargs["prompt_cache"] = stream_cache_store.reconstruct_cache(
+                        layer_states, trim_to=num_cached_tokens
+                    )
 
             # Streaming response
             async def stream_generator():
@@ -1307,16 +1304,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                 cache_store = get_prompt_cache_store(request.model)
                 cached = cache_store.get(msg_ranges, all_token_ids)
                 if cached is not None:
-                    layer_states, num_cached_tokens = cached
-                    prompt_cache = cache_store.reconstruct_cache(
-                        layer_states, trim_to=num_cached_tokens
-                    )
-                    generation_kwargs["prompt_cache"] = prompt_cache
-                    logger.info(
-                        "Cache hit: %d/%d tokens cached, prefilling %d remaining",
-                        num_cached_tokens, len(all_token_ids),
-                        len(all_token_ids) - num_cached_tokens,
-                    )
+                    live_cache, layer_states, num_cached_tokens = cached
+                    if live_cache is not None:
+                        generation_kwargs["prompt_cache"] = live_cache
+                    else:
+                        generation_kwargs["prompt_cache"] = cache_store.reconstruct_cache(
+                            layer_states, trim_to=num_cached_tokens
+                        )
 
                 gen_result = generate(
                     model=model,

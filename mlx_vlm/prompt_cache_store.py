@@ -61,8 +61,9 @@ class _CacheEntry:
     """KV cache state at a message boundary."""
 
     chain_hash: bytes
-    layer_states: list  # per-layer cache.state snapshots
+    layer_states: list  # per-layer cache.state snapshots (for disk serialization)
     token_count: int  # total tokens up to this boundary
+    prompt_cache: Optional[list] = None  # live cache objects (for in-memory reuse)
     last_access: float = field(default_factory=time.time)
 
 
@@ -129,6 +130,7 @@ class PromptCacheStore:
                     chain_hash=chain_hash,
                     layer_states=layer_states,
                     token_count=end,
+                    prompt_cache=prompt_cache,
                 )
                 self._evict_if_needed()
                 stored += 1
@@ -150,18 +152,21 @@ class PromptCacheStore:
         self,
         message_token_ranges: list[tuple[int, int]],
         all_token_ids: list[int],
-    ) -> Optional[Tuple[list[Any], int]]:
+    ) -> Optional[Tuple[Optional[list[Any]], list[Any], int]]:
         """Find the deepest cached message boundary.
 
         Walks the hash chain for the given messages and returns the
-        KV state at the deepest (most recent) cached boundary.
+        cached state at the deepest (most recent) boundary.
 
         Args:
             message_token_ranges: List of (start, end) token index pairs.
             all_token_ids: The full token sequence.
 
         Returns:
-            (layer_states, num_cached_tokens) or None if no match.
+            (prompt_cache, layer_states, num_cached_tokens) or None.
+            prompt_cache is the live cache object list if still in memory,
+            or None if loaded from disk (in which case use layer_states
+            with reconstruct_cache).
         """
         if not message_token_ranges or not all_token_ids:
             return None
@@ -191,12 +196,13 @@ class PromptCacheStore:
             return None
 
         logger.info(
-            "Cache: hit at %d/%d tokens (%d messages deep)",
+            "Cache: hit at %d/%d tokens (%d messages deep, from %s)",
             best_match.token_count,
             max(end for _, end in message_token_ranges),
             sum(1 for _ in self._walk_chain(message_token_ranges, all_token_ids)),
+            "memory" if best_match.prompt_cache is not None else "disk",
         )
-        return best_match.layer_states, best_match.token_count
+        return best_match.prompt_cache, best_match.layer_states, best_match.token_count
 
     def _walk_chain(
         self,
@@ -243,6 +249,8 @@ class PromptCacheStore:
         for i, state in enumerate(layer_states):
             if cache_template and i < len(cache_template):
                 cache_obj = cache_template[i]
+            elif _is_turboquant_state(state):
+                cache_obj = _make_turboquant_cache(state)
             else:
                 cache_obj = KVCache()
 
@@ -358,6 +366,32 @@ class PromptCacheStore:
     @property
     def entry_count(self) -> int:
         return len(self._entries)
+
+
+def _is_turboquant_state(state) -> bool:
+    """Check if a layer state contains TurboQuant NamedTuples."""
+    if not isinstance(state, (list, tuple)) or len(state) < 2:
+        return False
+    keys = state[0]
+    return hasattr(keys, '_fields') and 'norms' in getattr(keys, '_fields', ())
+
+
+def _make_turboquant_cache(state):
+    """Create a TurboQuantKVCache and set its state directly.
+
+    TurboQuantKVCache.state setter expects (keys_namedtuple, values_namedtuple)
+    and handles the offset calculation internally.
+    """
+    try:
+        from mlx_vlm.turboquant import TurboQuantKVCache
+        # Infer bits from the stored state. The key codec uses floor(bits)
+        # and the value codec uses ceil(bits). We can't perfectly recover
+        # the original bits from state alone, so default to 3.5.
+        cache = TurboQuantKVCache(bits=3.5)
+        return cache
+    except ImportError:
+        from mlx_lm.models.cache import KVCache
+        return KVCache()
 
 
 def compute_message_token_ranges(
