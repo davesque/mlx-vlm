@@ -103,3 +103,32 @@ class TestPromptCacheStore:
         # First entry evicted
         assert store.get(tokens_a) is None
         assert store.get(tokens_b) is not None
+
+
+class TestCacheReconstruction:
+    def test_reconstruct_kvcache(self):
+        """Store a KVCache, retrieve it, use it for continued generation."""
+        store = PromptCacheStore(model_name="test")
+        tokens = list(range(BLOCK_SIZE))
+        cache = _make_dummy_cache(num_layers=2, seq_len=BLOCK_SIZE)
+
+        # Fill cache with recognizable data
+        for layer_cache in cache:
+            k, v = layer_cache.state
+            layer_cache.state = (mx.ones_like(k), mx.ones_like(v) * 2)
+
+        store.put(tokens, cache)
+        result = store.get(tokens)
+        assert result is not None
+        layer_states, n_tokens = result
+        assert n_tokens == BLOCK_SIZE
+
+        # Reconstruct cache objects from stored states
+        reconstructed = store.reconstruct_cache(layer_states)
+        assert len(reconstructed) == 2
+        for rc in reconstructed:
+            k, v = rc.state
+            assert k.shape[2] == BLOCK_SIZE
+            # Verify data survived round-trip
+            assert mx.allclose(k, mx.ones_like(k))
+            assert mx.allclose(v, mx.ones_like(v) * 2)

@@ -155,6 +155,33 @@ class PromptCacheStore:
         )
         return block.layer_states, num_matched_tokens
 
+    def reconstruct_cache(
+        self,
+        layer_states: list,
+        cache_template: Optional[list[Any]] = None,
+    ) -> list[Any]:
+        """Reconstruct a prompt_cache list from stored layer states.
+
+        Args:
+            layer_states: Per-layer state snapshots from get().
+            cache_template: Optional list of empty cache objects to populate.
+                If None, creates KVCache objects for each layer.
+
+        Returns:
+            List of cache objects with state restored, ready for generate_step.
+        """
+        from mlx_lm.models.cache import KVCache
+
+        result = []
+        for i, state in enumerate(layer_states):
+            if cache_template and i < len(cache_template):
+                cache_obj = cache_template[i]
+            else:
+                cache_obj = KVCache()
+            cache_obj.state = state
+            result.append(cache_obj)
+        return result
+
     def _evict_if_needed(self) -> None:
         while len(self._blocks) > self.max_entries:
             evicted_hash, evicted = self._blocks.popitem(last=False)
