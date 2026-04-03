@@ -1,6 +1,7 @@
 import argparse
 import gc
 import json
+import logging
 import os
 import re
 import time
@@ -10,6 +11,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 import mlx.core as mx
 import uvicorn
@@ -124,9 +127,9 @@ async def lifespan(app):
     # Save prompt caches to disk on shutdown
     if _prompt_cache_dir is not None:
         for model_name, store in _prompt_cache_stores.items():
-            if store.block_count > 0:
+            if store.entry_count > 0:
                 model_cache_dir = _prompt_cache_dir / model_name.replace("/", "_")
-                print(f"Saving prompt cache for {model_name} to {model_cache_dir}...")
+                logger.info("Saving prompt cache for %s to %s", model_name, model_cache_dir)
                 store.save_to_disk(model_cache_dir)
 
     unload_model_sync()
@@ -1158,13 +1161,14 @@ async def chat_completions_endpoint(request: ChatRequest):
             stream_cached = stream_cache_store.get(stream_prompt_token_ids)
             if stream_cached is not None:
                 layer_states, num_cached_tokens = stream_cached
-                prompt_cache = stream_cache_store.reconstruct_cache(layer_states)
+                prompt_cache = stream_cache_store.reconstruct_cache(
+                    layer_states, trim_to=num_cached_tokens
+                )
                 generation_kwargs["prompt_cache"] = prompt_cache
-                print(
-                    f"Cache hit (stream): {num_cached_tokens}/"
-                    f"{len(stream_prompt_token_ids)} tokens cached, "
-                    f"prefilling "
-                    f"{len(stream_prompt_token_ids) - num_cached_tokens} remaining"
+                logger.info(
+                    "Cache hit (stream): %d/%d tokens cached, prefilling %d remaining",
+                    num_cached_tokens, len(stream_prompt_token_ids),
+                    len(stream_prompt_token_ids) - num_cached_tokens,
                 )
 
             # Streaming response
@@ -1224,12 +1228,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                         and hasattr(last_chunk, "prompt_cache")
                         and last_chunk.prompt_cache is not None
                     ):
-                        output_token_ids = tokenizer.encode(
-                            output_text, add_special_tokens=False
+                        stable_prompt = apply_chat_template(
+                            processor, config, processed_messages,
+                            num_images=len(images), num_audios=len(audio),
+                            add_generation_prompt=False,
+                            **template_kwargs,
                         )
-                        all_token_ids = stream_prompt_token_ids + output_token_ids
+                        stable_token_ids = tokenizer.encode(
+                            stable_prompt, add_special_tokens=add_special,
+                        )
                         stream_cache_store.put(
-                            all_token_ids, last_chunk.prompt_cache
+                            stable_token_ids, last_chunk.prompt_cache
                         )
 
                     if tool_parser_type is not None:
@@ -1303,12 +1312,14 @@ async def chat_completions_endpoint(request: ChatRequest):
                 cached = cache_store.get(prompt_token_ids)
                 if cached is not None:
                     layer_states, num_cached_tokens = cached
-                    prompt_cache = cache_store.reconstruct_cache(layer_states)
+                    prompt_cache = cache_store.reconstruct_cache(
+                        layer_states, trim_to=num_cached_tokens
+                    )
                     generation_kwargs["prompt_cache"] = prompt_cache
-                    print(
-                        f"Cache hit: {num_cached_tokens}/{len(prompt_token_ids)} "
-                        f"tokens cached, prefilling "
-                        f"{len(prompt_token_ids) - num_cached_tokens} remaining"
+                    logger.info(
+                        "Cache hit: %d/%d tokens cached, prefilling %d remaining",
+                        num_cached_tokens, len(prompt_token_ids),
+                        len(prompt_token_ids) - num_cached_tokens,
                     )
 
                 gen_result = generate(
@@ -1321,16 +1332,23 @@ async def chat_completions_endpoint(request: ChatRequest):
                     **generation_kwargs,
                 )
 
-                # Store cache for future reuse
+                # Store cache keyed by stable prefix (conversation history
+                # without the generation prompt suffix, which changes between
+                # turns). The next request's prompt starts with this prefix.
                 if (
                     hasattr(gen_result, "prompt_cache")
                     and gen_result.prompt_cache is not None
                 ):
-                    output_token_ids = tokenizer.encode(
-                        gen_result.text, add_special_tokens=False
+                    stable_prompt = apply_chat_template(
+                        processor, config, processed_messages,
+                        num_images=len(images), num_audios=len(audio),
+                        add_generation_prompt=False,
+                        **template_kwargs,
                     )
-                    all_token_ids = prompt_token_ids + output_token_ids
-                    cache_store.put(all_token_ids, gen_result.prompt_cache)
+                    stable_token_ids = tokenizer.encode(
+                        stable_prompt, add_special_tokens=add_special,
+                    )
+                    cache_store.put(stable_token_ids, gen_result.prompt_cache)
 
                 mx.clear_cache()
                 print("Generation finished.")

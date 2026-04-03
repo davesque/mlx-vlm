@@ -1,4 +1,13 @@
-"""Persistent KV cache store for multi-turn conversation reuse."""
+"""Persistent KV cache store for multi-turn conversation reuse.
+
+Stores full KV cache snapshots keyed by token sequence. Supports
+multiple concurrent conversations with prefix-based matching (e.g.
+forked sessions share their common prefix cache).
+
+Design: no fixed block size. Each entry stores the exact token sequence
+and the full cache state. On lookup, finds the stored entry whose tokens
+are the longest prefix of the new request.
+"""
 
 from __future__ import annotations
 
@@ -6,116 +15,98 @@ import hashlib
 import json
 import logging
 import time
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 
-BLOCK_SIZE = 1024
-
 logger = logging.getLogger(__name__)
 
 
-def compute_block_hash(
-    parent_hash: Optional[bytes],
-    token_ids: List[int],
-    model_name: Optional[str] = None,
-) -> bytes:
-    """Compute a content-based hash for a block of tokens.
-
-    Each block's hash encodes its full prefix context via the parent
-    hash chain, enabling O(1) prefix matching.
-    """
-    hasher = hashlib.sha256()
-    if model_name:
-        hasher.update(model_name.encode("utf-8"))
-    if parent_hash:
-        hasher.update(parent_hash)
-    else:
-        hasher.update(b"mlx-vlm-root")
-    hasher.update(bytes(str(tuple(token_ids)), "utf-8"))
-    return hasher.digest()
-
-
 @dataclass
-class _CachedBlock:
-    """One block's worth of KV cache data, keyed by block hash."""
+class _CacheEntry:
+    """A cached KV state for a specific token sequence."""
 
-    block_hash: bytes
-    # Per-layer list of cache.state snapshots at this block boundary.
-    layer_states: list
-    token_count: int
+    token_ids: list[int]
+    layer_states: list  # per-layer cache.state snapshots
     last_access: float = field(default_factory=time.time)
 
 
 class PromptCacheStore:
-    """In-memory KV cache store with block-level prefix matching.
+    """In-memory KV cache store with prefix matching.
 
-    Stores KV cache state at block boundaries (every BLOCK_SIZE tokens).
-    On lookup, finds the longest matching prefix by walking the block
-    hash chain. Provides LRU eviction by block count.
+    Stores KV cache state for complete token sequences. On lookup,
+    finds the entry whose token sequence is the longest prefix of
+    the query. Supports forked conversations: two sessions that
+    diverge from a common prefix will both match the parent entry.
+
+    LRU eviction keeps memory bounded to max_entries conversations.
     """
 
     def __init__(
         self,
         model_name: str = "",
-        max_entries: int = 256,
+        max_entries: int = 16,
     ):
         self.model_name = model_name
         self.max_entries = max_entries
-        self._blocks: OrderedDict[bytes, _CachedBlock] = OrderedDict()
+        self._entries: list[_CacheEntry] = []
 
     def put(
         self,
         token_ids: list[int],
         prompt_cache: list[Any],
-    ) -> int:
-        """Store cache state, returning number of blocks stored."""
-        num_full_blocks = len(token_ids) // BLOCK_SIZE
-        if num_full_blocks == 0:
-            return 0
+    ) -> None:
+        """Store cache state for a token sequence.
 
-        stored = 0
-        parent_hash = None
+        If an existing entry has the same tokens (exact match), it is
+        replaced. Otherwise a new entry is added.
+        """
+        if not token_ids:
+            return
 
-        for i in range(num_full_blocks):
-            start = i * BLOCK_SIZE
-            end = start + BLOCK_SIZE
-            block_tokens = token_ids[start:end]
-            block_hash = compute_block_hash(
-                parent_hash, block_tokens, model_name=self.model_name,
-            )
+        layer_states = [cache_obj.state for cache_obj in prompt_cache]
 
-            if block_hash not in self._blocks:
-                # Snapshot each layer's state at this point
-                layer_states = []
-                for cache_obj in prompt_cache:
-                    state = cache_obj.state
-                    layer_states.append(state)
-
-                self._blocks[block_hash] = _CachedBlock(
-                    block_hash=block_hash,
-                    layer_states=layer_states,
-                    token_count=end,
+        # Check for exact match (same conversation, updated)
+        for i, entry in enumerate(self._entries):
+            if entry.token_ids == token_ids:
+                entry.layer_states = layer_states
+                entry.last_access = time.time()
+                logger.info(
+                    "Cache: updated existing entry (%d tokens)", len(token_ids)
                 )
-                self._evict_if_needed()
-                stored += 1
-            else:
-                self._blocks.move_to_end(block_hash)
-                self._blocks[block_hash].last_access = time.time()
+                return
 
-            parent_hash = block_hash
+        # Check if this extends an existing entry (same conversation, grew)
+        # Replace the parent entry since its cache is a subset of the new one
+        best_prefix_idx = -1
+        best_prefix_len = 0
+        for i, entry in enumerate(self._entries):
+            n = len(entry.token_ids)
+            if n < len(token_ids) and token_ids[:n] == entry.token_ids:
+                if n > best_prefix_len:
+                    best_prefix_len = n
+                    best_prefix_idx = i
 
-        if stored > 0:
-            logger.info(
-                "Cache store: saved %d new blocks (%d tokens, total blocks=%d)",
-                stored,
-                num_full_blocks * BLOCK_SIZE,
-                len(self._blocks),
+        if best_prefix_idx >= 0:
+            self._entries[best_prefix_idx] = _CacheEntry(
+                token_ids=list(token_ids),
+                layer_states=layer_states,
             )
-        return stored
+            logger.info(
+                "Cache: extended conversation %d -> %d tokens",
+                best_prefix_len, len(token_ids),
+            )
+            return
+
+        # New conversation
+        self._entries.append(_CacheEntry(
+            token_ids=list(token_ids),
+            layer_states=layer_states,
+        ))
+        logger.info("Cache: new conversation (%d tokens)", len(token_ids))
+        self._evict_if_needed()
 
     def get(
         self,
@@ -125,49 +116,54 @@ class PromptCacheStore:
 
         Returns (layer_states, num_matched_tokens) or None if no match.
         """
-        num_full_blocks = len(token_ids) // BLOCK_SIZE
-        if num_full_blocks == 0:
+        if not token_ids:
             return None
 
-        parent_hash = None
-        last_match: Optional[tuple[_CachedBlock, int]] = None
+        best_entry = None
+        best_len = 0
 
-        for i in range(num_full_blocks):
-            start = i * BLOCK_SIZE
-            end = start + BLOCK_SIZE
-            block_tokens = token_ids[start:end]
-            block_hash = compute_block_hash(
-                parent_hash, block_tokens, model_name=self.model_name,
-            )
+        for entry in self._entries:
+            n = len(entry.token_ids)
+            # Entry must be a prefix of (or equal to) the query
+            if n <= len(token_ids):
+                match = token_ids[:n] == entry.token_ids
+                if not match and n > 0 and logger.isEnabledFor(logging.DEBUG):
+                    for j in range(min(n, len(token_ids))):
+                        if entry.token_ids[j] != token_ids[j]:
+                            logger.debug(
+                                "Cache: prefix mismatch at token %d: "
+                                "stored=%d, query=%d (stored_len=%d, query_len=%d)",
+                                j, entry.token_ids[j], token_ids[j], n, len(token_ids),
+                            )
+                            break
+                if match and n > best_len:
+                    best_len = n
+                    best_entry = entry
 
-            if block_hash not in self._blocks:
-                break
-
-            self._blocks.move_to_end(block_hash)
-            self._blocks[block_hash].last_access = time.time()
-            last_match = (self._blocks[block_hash], end)
-            parent_hash = block_hash
-
-        if last_match is None:
+        if best_entry is None:
             return None
 
-        block, num_matched_tokens = last_match
+        best_entry.last_access = time.time()
         logger.info(
-            "Cache hit: %d tokens (%d blocks)",
-            num_matched_tokens,
-            num_matched_tokens // BLOCK_SIZE,
+            "Cache: hit %d/%d tokens cached, %d new",
+            best_len, len(token_ids), len(token_ids) - best_len,
         )
-        return block.layer_states, num_matched_tokens
+        return best_entry.layer_states, best_len
 
     def reconstruct_cache(
         self,
         layer_states: list,
+        trim_to: Optional[int] = None,
         cache_template: Optional[list[Any]] = None,
     ) -> list[Any]:
         """Reconstruct a prompt_cache list from stored layer states.
 
         Args:
             layer_states: Per-layer state snapshots from get().
+            trim_to: If set, trim each layer's KV state to this many
+                tokens. Used when the stored cache has more state than
+                the prefix match length (e.g. cache includes generated
+                tokens beyond the matched prefix).
             cache_template: Optional list of empty cache objects to populate.
                 If None, creates KVCache objects for each layer.
 
@@ -182,32 +178,49 @@ class PromptCacheStore:
                 cache_obj = cache_template[i]
             else:
                 cache_obj = KVCache()
+
+            if trim_to is not None and state is not None:
+                state = _trim_state(state, trim_to)
+
             cache_obj.state = state
             result.append(cache_obj)
         return result
 
     def _evict_if_needed(self) -> None:
-        while len(self._blocks) > self.max_entries:
-            evicted_hash, evicted = self._blocks.popitem(last=False)
-            logger.debug("Cache eviction: block %s", evicted_hash.hex()[:16])
+        while len(self._entries) > self.max_entries:
+            # Remove least recently accessed
+            oldest_idx = min(
+                range(len(self._entries)),
+                key=lambda i: self._entries[i].last_access,
+            )
+            evicted = self._entries.pop(oldest_idx)
+            logger.info(
+                "Cache: evicted entry (%d tokens, %.1fs old)",
+                len(evicted.token_ids), time.time() - evicted.last_access,
+            )
 
     def save_to_disk(self, cache_dir: Path) -> int:
-        """Serialize all cached blocks to disk.
+        """Serialize all cached entries to disk.
 
-        Writes one safetensors file per block plus a JSON index.
-        Returns number of blocks saved.
+        Writes one safetensors file per entry plus a JSON index.
+        Returns number of entries saved.
         """
         cache_dir.mkdir(parents=True, exist_ok=True)
-        index = {"model_name": self.model_name, "block_size": BLOCK_SIZE, "blocks": []}
+        index = {
+            "model_name": self.model_name,
+            "entries": [],
+        }
         saved = 0
 
-        for block_hash, block in self._blocks.items():
-            hex_hash = block_hash.hex()
-            block_file = cache_dir / f"{hex_hash}.safetensors"
+        for i, entry in enumerate(self._entries):
+            entry_hash = hashlib.sha256(
+                str(entry.token_ids[:64]).encode()
+            ).hexdigest()[:16]
+            entry_file = cache_dir / f"entry_{i}_{entry_hash}.safetensors"
 
             arrays = {}
             metadata = {}
-            for layer_idx, state in enumerate(block.layer_states):
+            for layer_idx, state in enumerate(entry.layer_states):
                 if state is None or (
                     isinstance(state, tuple)
                     and len(state) == 2
@@ -219,23 +232,23 @@ class PromptCacheStore:
                 _serialize_layer_state(arrays, metadata, layer_idx, state)
 
             if arrays:
-                mx.save_safetensors(str(block_file), arrays, metadata)
+                mx.save_safetensors(str(entry_file), arrays, metadata)
 
-            index["blocks"].append({
-                "hash": hex_hash,
-                "token_count": block.token_count,
-                "num_layers": len(block.layer_states),
+            index["entries"].append({
+                "file": entry_file.name,
+                "token_ids": entry.token_ids,
+                "num_layers": len(entry.layer_states),
             })
             saved += 1
 
         with open(cache_dir / "cache_index.json", "w") as f:
-            json.dump(index, f, indent=2)
+            json.dump(index, f)
 
-        logger.info("Cache saved: %d blocks to %s", saved, cache_dir)
+        logger.info("Cache: saved %d entries to %s", saved, cache_dir)
         return saved
 
     def load_from_disk(self, cache_dir: Path) -> int:
-        """Load cached blocks from disk. Returns number of blocks loaded."""
+        """Load cached entries from disk. Returns number of entries loaded."""
         index_path = cache_dir / "cache_index.json"
         if not index_path.exists():
             return 0
@@ -245,48 +258,63 @@ class PromptCacheStore:
 
         if index.get("model_name") != self.model_name:
             logger.warning(
-                "Cache model mismatch: disk=%s, current=%s. Skipping load.",
-                index.get("model_name"),
-                self.model_name,
+                "Cache: model mismatch (disk=%s, current=%s), skipping load",
+                index.get("model_name"), self.model_name,
             )
             return 0
 
         loaded = 0
-        for block_info in index["blocks"]:
-            hex_hash = block_info["hash"]
-            block_hash = bytes.fromhex(hex_hash)
-            block_file = cache_dir / f"{hex_hash}.safetensors"
-
-            if not block_file.exists():
+        for entry_info in index["entries"]:
+            entry_file = cache_dir / entry_info["file"]
+            if not entry_file.exists():
                 continue
 
-            arrays, file_metadata = mx.load(str(block_file), return_metadata=True)
-            num_layers = block_info["num_layers"]
+            arrays, file_metadata = mx.load(
+                str(entry_file), return_metadata=True
+            )
+            num_layers = entry_info["num_layers"]
 
             layer_states = []
             for layer_idx in range(num_layers):
                 if file_metadata.get(f"layer_{layer_idx}_empty") == "1":
                     layer_states.append((None, None))
                     continue
-                state = _deserialize_layer_state(arrays, file_metadata, layer_idx)
+                state = _deserialize_layer_state(
+                    arrays, file_metadata, layer_idx
+                )
                 layer_states.append(state)
 
-            self._blocks[block_hash] = _CachedBlock(
-                block_hash=block_hash,
+            self._entries.append(_CacheEntry(
+                token_ids=entry_info["token_ids"],
                 layer_states=layer_states,
-                token_count=block_info["token_count"],
-            )
+            ))
             loaded += 1
 
-        logger.info("Cache loaded: %d blocks from %s", loaded, cache_dir)
+        logger.info("Cache: loaded %d entries from %s", loaded, cache_dir)
         return loaded
 
     def clear(self) -> None:
-        self._blocks.clear()
+        self._entries.clear()
 
     @property
-    def block_count(self) -> int:
-        return len(self._blocks)
+    def entry_count(self) -> int:
+        return len(self._entries)
+
+
+def _trim_state(state, length: int):
+    """Trim a layer's KV state to the given sequence length.
+
+    Handles plain (keys, values) tuples where keys/values have shape
+    (B, H, T, D). Sequence is on axis 2.
+    """
+    if isinstance(state, (list, tuple)) and len(state) >= 2:
+        keys, values = state[0], state[1]
+        if isinstance(keys, mx.array) and len(keys.shape) == 4:
+            if keys.shape[2] > length:
+                keys = keys[:, :, :length, :]
+                values = values[:, :, :length, :]
+            return (keys, values)
+    return state
 
 
 def _serialize_layer_state(
@@ -296,12 +324,10 @@ def _serialize_layer_state(
     if isinstance(state, (list, tuple)) and len(state) >= 2:
         keys, values = state[0], state[1]
         if isinstance(keys, mx.array) and isinstance(values, mx.array):
-            # Standard KVCache: (keys, values) tuple of arrays
             metadata[f"layer_{layer_idx}_type"] = "kv"
             arrays[f"layer_{layer_idx}_keys"] = keys
             arrays[f"layer_{layer_idx}_values"] = values
             return
-        # Could be NamedTuples (TurboQuant) - serialize each field
         if hasattr(keys, "_fields") and hasattr(values, "_fields"):
             metadata[f"layer_{layer_idx}_type"] = "tq_pair"
             metadata[f"layer_{layer_idx}_keys_type"] = type(keys).__name__
@@ -315,7 +341,6 @@ def _serialize_layer_state(
                 if isinstance(val, mx.array):
                     arrays[f"layer_{layer_idx}_v_{field_name}"] = val
             return
-    # Single NamedTuple state
     if hasattr(state, "_fields"):
         metadata[f"layer_{layer_idx}_type"] = type(state).__name__
         for field_name in state._fields:
@@ -346,14 +371,12 @@ def _deserialize_layer_state(arrays: dict, metadata: dict, layer_idx: int):
             for k, v in arrays.items()
             if k.startswith(v_prefix)
         }
-
         keys_type_name = metadata.get(f"layer_{layer_idx}_keys_type")
         values_type_name = metadata.get(f"layer_{layer_idx}_values_type")
         keys_state = _rebuild_namedtuple(keys_type_name, k_arrays)
         values_state = _rebuild_namedtuple(values_type_name, v_arrays)
         return (keys_state, values_state)
 
-    # Unknown type, try to reconstruct as plain tuple
     keys = arrays.get(f"layer_{layer_idx}_keys")
     values = arrays.get(f"layer_{layer_idx}_values")
     if keys is not None and values is not None:
@@ -361,7 +384,6 @@ def _deserialize_layer_state(arrays: dict, metadata: dict, layer_idx: int):
     return None
 
 
-# Registry for deserializing NamedTuples by name.
 _NAMEDTUPLE_REGISTRY: dict[str, type] = {}
 
 
