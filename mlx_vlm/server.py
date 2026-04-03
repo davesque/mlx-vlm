@@ -108,6 +108,11 @@ def get_quantized_kv_start():
 @asynccontextmanager
 async def lifespan(app):
     global _prompt_cache_dir
+
+    # Ensure cache logging is visible (uvicorn configures root logger)
+    logging.getLogger("mlx_vlm.prompt_cache_store").setLevel(logging.INFO)
+    logging.getLogger("mlx_vlm.server").setLevel(logging.INFO)
+
     _prompt_cache_dir = Path(
         os.environ.get("PROMPT_CACHE_DIR", os.path.expanduser("~/.mlx_vlm/cache"))
     )
