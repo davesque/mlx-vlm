@@ -135,13 +135,10 @@ async def lifespan(app):
             print("Server will continue without a preloaded model.")
     yield
 
-    # Save prompt caches to disk on shutdown
-    if _prompt_cache_dir is not None:
-        for model_name, store in _prompt_cache_stores.items():
-            if store.entry_count > 0:
-                model_cache_dir = _prompt_cache_dir / model_name.replace("/", "_")
-                logger.info("Saving prompt cache for %s to %s", model_name, model_cache_dir)
-                store.save_to_disk(model_cache_dir)
+    # TODO: Disk persistence is disabled for now because TurboQuant
+    # cache states can't be reconstructed from disk (requires codec
+    # re-initialization). Re-enable once plain KVCache detection or
+    # TurboQuant codec serialization is implemented.
 
     unload_model_sync()
 
@@ -1171,14 +1168,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                 if live_cache is not None:
                     generation_kwargs["prompt_cache"] = live_cache
                     generation_kwargs["cached_token_count"] = num_cached_tokens
-                else:
-                    try:
-                        generation_kwargs["prompt_cache"] = stream_cache_store.reconstruct_cache(
-                            layer_states, trim_to=num_cached_tokens
-                        )
-                        generation_kwargs["cached_token_count"] = num_cached_tokens
-                    except Exception as e:
-                        logger.warning("Cache: disk reconstruction failed (%s), falling back to full prefill", e)
 
             # Streaming response
             async def stream_generator():
@@ -1329,14 +1318,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                     if live_cache is not None:
                         generation_kwargs["prompt_cache"] = live_cache
                         generation_kwargs["cached_token_count"] = num_cached_tokens
-                    else:
-                        try:
-                            generation_kwargs["prompt_cache"] = cache_store.reconstruct_cache(
-                                layer_states, trim_to=num_cached_tokens
-                            )
-                            generation_kwargs["cached_token_count"] = num_cached_tokens
-                        except Exception as e:
-                            logger.warning("Cache: disk reconstruction failed (%s), falling back to full prefill", e)
 
                 gen_result = generate(
                     model=model,
