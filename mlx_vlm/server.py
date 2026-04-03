@@ -109,9 +109,14 @@ def get_quantized_kv_start():
 async def lifespan(app):
     global _prompt_cache_dir
 
-    # Ensure cache logging is visible (uvicorn configures root logger)
-    logging.getLogger("mlx_vlm.prompt_cache_store").setLevel(logging.INFO)
-    logging.getLogger("mlx_vlm.server").setLevel(logging.INFO)
+    # Ensure cache logging is visible. Uvicorn may not set up a root
+    # handler, so third-party loggers have nowhere to send output.
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(name)s - %(levelname)s - %(message)s",
+        )
+    logging.getLogger("mlx_vlm").setLevel(logging.INFO)
 
     _prompt_cache_dir = Path(
         os.environ.get("PROMPT_CACHE_DIR", os.path.expanduser("~/.mlx_vlm/cache"))
