@@ -114,7 +114,8 @@ async def lifespan(app):
     if not logging.root.handlers:
         logging.basicConfig(
             level=logging.INFO,
-            format="%(name)s - %(levelname)s - %(message)s",
+            format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
         )
     logging.getLogger("mlx_vlm").setLevel(logging.INFO)
 
