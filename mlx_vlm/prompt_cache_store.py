@@ -1,12 +1,22 @@
 """Persistent KV cache store for multi-turn conversation reuse.
 
-Stores full KV cache snapshots keyed by token sequence. Supports
-multiple concurrent conversations with prefix-based matching (e.g.
-forked sessions share their common prefix cache).
+Caches KV state at message boundaries using a hash chain (similar to
+a blockchain). Each message boundary's hash commits to the entire
+conversation history, enabling:
 
-Design: no fixed block size. Each entry stores the exact token sequence
-and the full cache state. On lookup, finds the stored entry whose tokens
-are the longest prefix of the new request.
+- O(1) prefix lookup via hash dict
+- Shared system prompts across sessions (same hash = same state)
+- Forked conversations (forks share ancestor entries)
+- Per-message granularity (no wasted tokens at block boundaries)
+
+Design:
+  Hash(msg_0) = sha256(root + tokens_of_msg_0)
+  Hash(msg_0, msg_1) = sha256(Hash(msg_0) + tokens_of_msg_1)
+  ...
+
+Each hash maps to the KV cache state at that point in the conversation.
+On lookup, we walk the new request's message chain and find the deepest
+hash that exists in the store.
 """
 
 from __future__ import annotations
@@ -15,6 +25,7 @@ import hashlib
 import json
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -24,131 +35,187 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 
+def compute_chain_hash(
+    parent_hash: Optional[bytes],
+    token_ids: List[int],
+    model_name: Optional[str] = None,
+) -> bytes:
+    """Compute a chain hash for a message boundary.
+
+    Each hash commits to the full conversation history via the parent
+    chain, just like a block in a blockchain.
+    """
+    hasher = hashlib.sha256()
+    if model_name:
+        hasher.update(model_name.encode("utf-8"))
+    if parent_hash:
+        hasher.update(parent_hash)
+    else:
+        hasher.update(b"mlx-vlm-root")
+    hasher.update(bytes(str(tuple(token_ids)), "utf-8"))
+    return hasher.digest()
+
+
 @dataclass
 class _CacheEntry:
-    """A cached KV state for a specific token sequence."""
+    """KV cache state at a message boundary."""
 
-    token_ids: list[int]
+    chain_hash: bytes
     layer_states: list  # per-layer cache.state snapshots
+    token_count: int  # total tokens up to this boundary
     last_access: float = field(default_factory=time.time)
 
 
 class PromptCacheStore:
-    """In-memory KV cache store with prefix matching.
+    """In-memory KV cache store with message-boundary hash chain.
 
-    Stores KV cache state for complete token sequences. On lookup,
-    finds the entry whose token sequence is the longest prefix of
-    the query. Supports forked conversations: two sessions that
-    diverge from a common prefix will both match the parent entry.
+    Stores KV cache state at each message boundary in a conversation.
+    Uses a hash chain so that:
+    - Shared system prompts hit the same entry across all sessions
+    - Forked conversations share all common ancestor entries
+    - Lookup is O(num_messages) hash computations + O(1) dict lookups
+    - No fixed block size, no wasted tokens at boundaries
 
-    LRU eviction keeps memory bounded to max_entries conversations.
+    LRU eviction keeps memory bounded.
     """
 
     def __init__(
         self,
         model_name: str = "",
-        max_entries: int = 16,
+        max_entries: int = 128,
     ):
         self.model_name = model_name
         self.max_entries = max_entries
-        self._entries: list[_CacheEntry] = []
+        # chain_hash -> _CacheEntry
+        self._entries: OrderedDict[bytes, _CacheEntry] = OrderedDict()
 
     def put(
         self,
-        token_ids: list[int],
+        message_token_ranges: list[tuple[int, int]],
+        all_token_ids: list[int],
         prompt_cache: list[Any],
-    ) -> None:
-        """Store cache state for a token sequence.
+    ) -> int:
+        """Store KV cache state at each message boundary.
 
-        If an existing entry has the same tokens (exact match), it is
-        replaced. Otherwise a new entry is added.
+        Args:
+            message_token_ranges: List of (start, end) token index pairs,
+                one per message. These define the message boundaries.
+            all_token_ids: The full token sequence for the conversation.
+            prompt_cache: The live KV cache after generation.
+
+        Returns:
+            Number of new entries stored.
         """
-        if not token_ids:
-            return
+        if not message_token_ranges or not all_token_ids:
+            return 0
 
-        layer_states = [cache_obj.state for cache_obj in prompt_cache]
+        stored = 0
+        parent_hash = None
 
-        # Check for exact match (same conversation, updated)
-        for i, entry in enumerate(self._entries):
-            if entry.token_ids == token_ids:
-                entry.layer_states = layer_states
-                entry.last_access = time.time()
-                logger.info(
-                    "Cache: updated existing entry (%d tokens)", len(token_ids)
+        for start, end in message_token_ranges:
+            msg_tokens = all_token_ids[start:end]
+            if not msg_tokens:
+                continue
+
+            chain_hash = compute_chain_hash(
+                parent_hash, msg_tokens, model_name=self.model_name,
+            )
+
+            if chain_hash not in self._entries:
+                # Snapshot the full cache state at this boundary
+                layer_states = [cache_obj.state for cache_obj in prompt_cache]
+
+                self._entries[chain_hash] = _CacheEntry(
+                    chain_hash=chain_hash,
+                    layer_states=layer_states,
+                    token_count=end,
                 )
-                return
+                self._evict_if_needed()
+                stored += 1
+            else:
+                # Touch for LRU
+                self._entries.move_to_end(chain_hash)
+                self._entries[chain_hash].last_access = time.time()
 
-        # Check if this extends an existing entry (same conversation, grew)
-        # Replace the parent entry since its cache is a subset of the new one
-        best_prefix_idx = -1
-        best_prefix_len = 0
-        for i, entry in enumerate(self._entries):
-            n = len(entry.token_ids)
-            if n < len(token_ids) and token_ids[:n] == entry.token_ids:
-                if n > best_prefix_len:
-                    best_prefix_len = n
-                    best_prefix_idx = i
+            parent_hash = chain_hash
 
-        if best_prefix_idx >= 0:
-            self._entries[best_prefix_idx] = _CacheEntry(
-                token_ids=list(token_ids),
-                layer_states=layer_states,
-            )
+        if stored > 0:
             logger.info(
-                "Cache: extended conversation %d -> %d tokens",
-                best_prefix_len, len(token_ids),
+                "Cache: stored %d new message boundaries (%d total entries)",
+                stored, len(self._entries),
             )
-            return
-
-        # New conversation
-        self._entries.append(_CacheEntry(
-            token_ids=list(token_ids),
-            layer_states=layer_states,
-        ))
-        logger.info("Cache: new conversation (%d tokens)", len(token_ids))
-        self._evict_if_needed()
+        return stored
 
     def get(
         self,
-        token_ids: list[int],
+        message_token_ranges: list[tuple[int, int]],
+        all_token_ids: list[int],
     ) -> Optional[Tuple[list[Any], int]]:
-        """Find the longest cached prefix for the given tokens.
+        """Find the deepest cached message boundary.
 
-        Returns (layer_states, num_matched_tokens) or None if no match.
+        Walks the hash chain for the given messages and returns the
+        KV state at the deepest (most recent) cached boundary.
+
+        Args:
+            message_token_ranges: List of (start, end) token index pairs.
+            all_token_ids: The full token sequence.
+
+        Returns:
+            (layer_states, num_cached_tokens) or None if no match.
         """
-        if not token_ids:
+        if not message_token_ranges or not all_token_ids:
             return None
 
-        best_entry = None
-        best_len = 0
+        parent_hash = None
+        best_match = None
 
-        for entry in self._entries:
-            n = len(entry.token_ids)
-            # Entry must be a prefix of (or equal to) the query
-            if n <= len(token_ids):
-                match = token_ids[:n] == entry.token_ids
-                if not match and n > 0 and logger.isEnabledFor(logging.DEBUG):
-                    for j in range(min(n, len(token_ids))):
-                        if entry.token_ids[j] != token_ids[j]:
-                            logger.debug(
-                                "Cache: prefix mismatch at token %d: "
-                                "stored=%d, query=%d (stored_len=%d, query_len=%d)",
-                                j, entry.token_ids[j], token_ids[j], n, len(token_ids),
-                            )
-                            break
-                if match and n > best_len:
-                    best_len = n
-                    best_entry = entry
+        for start, end in message_token_ranges:
+            msg_tokens = all_token_ids[start:end]
+            if not msg_tokens:
+                continue
 
-        if best_entry is None:
+            chain_hash = compute_chain_hash(
+                parent_hash, msg_tokens, model_name=self.model_name,
+            )
+
+            if chain_hash not in self._entries:
+                break
+
+            entry = self._entries[chain_hash]
+            self._entries.move_to_end(chain_hash)
+            entry.last_access = time.time()
+            best_match = entry
+            parent_hash = chain_hash
+
+        if best_match is None:
             return None
 
-        best_entry.last_access = time.time()
         logger.info(
-            "Cache: hit %d/%d tokens cached, %d new",
-            best_len, len(token_ids), len(token_ids) - best_len,
+            "Cache: hit at %d/%d tokens (%d messages deep)",
+            best_match.token_count,
+            max(end for _, end in message_token_ranges),
+            sum(1 for _ in self._walk_chain(message_token_ranges, all_token_ids)),
         )
-        return best_entry.layer_states, best_len
+        return best_match.layer_states, best_match.token_count
+
+    def _walk_chain(
+        self,
+        message_token_ranges: list[tuple[int, int]],
+        all_token_ids: list[int],
+    ):
+        """Yield matching chain hashes (for counting matched depth)."""
+        parent_hash = None
+        for start, end in message_token_ranges:
+            msg_tokens = all_token_ids[start:end]
+            if not msg_tokens:
+                continue
+            chain_hash = compute_chain_hash(
+                parent_hash, msg_tokens, model_name=self.model_name,
+            )
+            if chain_hash not in self._entries:
+                break
+            yield chain_hash
+            parent_hash = chain_hash
 
     def reconstruct_cache(
         self,
@@ -162,8 +229,8 @@ class PromptCacheStore:
             layer_states: Per-layer state snapshots from get().
             trim_to: If set, trim each layer's KV state to this many
                 tokens. Used when the stored cache has more state than
-                the prefix match length (e.g. cache includes generated
-                tokens beyond the matched prefix).
+                the matched boundary (e.g. cache includes generated
+                tokens beyond the matched point).
             cache_template: Optional list of empty cache objects to populate.
                 If None, creates KVCache objects for each layer.
 
@@ -188,23 +255,13 @@ class PromptCacheStore:
 
     def _evict_if_needed(self) -> None:
         while len(self._entries) > self.max_entries:
-            # Remove least recently accessed
-            oldest_idx = min(
-                range(len(self._entries)),
-                key=lambda i: self._entries[i].last_access,
-            )
-            evicted = self._entries.pop(oldest_idx)
-            logger.info(
-                "Cache: evicted entry (%d tokens, %.1fs old)",
-                len(evicted.token_ids), time.time() - evicted.last_access,
+            evicted_hash, evicted = self._entries.popitem(last=False)
+            logger.debug(
+                "Cache: evicted entry (%d tokens)", evicted.token_count,
             )
 
     def save_to_disk(self, cache_dir: Path) -> int:
-        """Serialize all cached entries to disk.
-
-        Writes one safetensors file per entry plus a JSON index.
-        Returns number of entries saved.
-        """
+        """Serialize all cached entries to disk."""
         cache_dir.mkdir(parents=True, exist_ok=True)
         index = {
             "model_name": self.model_name,
@@ -212,11 +269,9 @@ class PromptCacheStore:
         }
         saved = 0
 
-        for i, entry in enumerate(self._entries):
-            entry_hash = hashlib.sha256(
-                str(entry.token_ids[:64]).encode()
-            ).hexdigest()[:16]
-            entry_file = cache_dir / f"entry_{i}_{entry_hash}.safetensors"
+        for chain_hash, entry in self._entries.items():
+            hex_hash = chain_hash.hex()
+            entry_file = cache_dir / f"{hex_hash[:16]}.safetensors"
 
             arrays = {}
             metadata = {}
@@ -235,8 +290,9 @@ class PromptCacheStore:
                 mx.save_safetensors(str(entry_file), arrays, metadata)
 
             index["entries"].append({
+                "hash": hex_hash,
                 "file": entry_file.name,
-                "token_ids": entry.token_ids,
+                "token_count": entry.token_count,
                 "num_layers": len(entry.layer_states),
             })
             saved += 1
@@ -248,7 +304,7 @@ class PromptCacheStore:
         return saved
 
     def load_from_disk(self, cache_dir: Path) -> int:
-        """Load cached entries from disk. Returns number of entries loaded."""
+        """Load cached entries from disk. Returns number loaded."""
         index_path = cache_dir / "cache_index.json"
         if not index_path.exists():
             return 0
@@ -258,13 +314,15 @@ class PromptCacheStore:
 
         if index.get("model_name") != self.model_name:
             logger.warning(
-                "Cache: model mismatch (disk=%s, current=%s), skipping load",
+                "Cache: model mismatch (disk=%s, current=%s), skipping",
                 index.get("model_name"), self.model_name,
             )
             return 0
 
         loaded = 0
         for entry_info in index["entries"]:
+            hex_hash = entry_info["hash"]
+            chain_hash = bytes.fromhex(hex_hash)
             entry_file = cache_dir / entry_info["file"]
             if not entry_file.exists():
                 continue
@@ -284,10 +342,11 @@ class PromptCacheStore:
                 )
                 layer_states.append(state)
 
-            self._entries.append(_CacheEntry(
-                token_ids=entry_info["token_ids"],
+            self._entries[chain_hash] = _CacheEntry(
+                chain_hash=chain_hash,
                 layer_states=layer_states,
-            ))
+                token_count=entry_info["token_count"],
+            )
             loaded += 1
 
         logger.info("Cache: loaded %d entries from %s", loaded, cache_dir)
@@ -299,6 +358,65 @@ class PromptCacheStore:
     @property
     def entry_count(self) -> int:
         return len(self._entries)
+
+
+def compute_message_token_ranges(
+    processor,
+    config,
+    messages: list[dict],
+    template_kwargs: Optional[dict] = None,
+) -> tuple[list[tuple[int, int]], list[int]]:
+    """Compute token ranges for each message boundary.
+
+    Tokenizes the conversation at each message prefix to find the
+    exact token boundaries. Returns the ranges and full token IDs.
+
+    Args:
+        processor: The tokenizer/processor.
+        config: Model config (for add_special_tokens logic).
+        messages: List of {"role": ..., "content": ...} dicts.
+        template_kwargs: Extra kwargs for apply_chat_template.
+
+    Returns:
+        (message_token_ranges, all_token_ids) where ranges is a list
+        of (start, end) pairs and all_token_ids is the full sequence.
+    """
+    from mlx_vlm.server import apply_chat_template
+
+    tokenizer = (
+        processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    )
+    add_special = (
+        not hasattr(processor, "chat_template")
+        if getattr(config, "model_type", "") in ("gemma3", "gemma3n", "gemma4")
+        else True
+    )
+
+    tkw = template_kwargs or {}
+    ranges = []
+    prev_end = 0
+
+    for i in range(1, len(messages) + 1):
+        prefix_messages = messages[:i]
+        prefix_text = apply_chat_template(
+            processor, config, prefix_messages,
+            add_generation_prompt=False,
+            **tkw,
+        )
+        prefix_tokens = tokenizer.encode(prefix_text, add_special_tokens=add_special)
+        end = len(prefix_tokens)
+        ranges.append((prev_end, end))
+        prev_end = end
+
+    # Full prompt with generation prompt
+    full_text = apply_chat_template(
+        processor, config, messages,
+        add_generation_prompt=True,
+        **tkw,
+    )
+    all_token_ids = tokenizer.encode(full_text, add_special_tokens=add_special)
+
+    return ranges, all_token_ids
 
 
 def _trim_state(state, length: int):

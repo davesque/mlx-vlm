@@ -39,7 +39,7 @@ from .generate import (
     normalize_resize_shape,
     stream_generate,
 )
-from .prompt_cache_store import PromptCacheStore
+from .prompt_cache_store import PromptCacheStore, compute_message_token_ranges
 from .prompt_utils import apply_chat_template
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
@@ -1151,19 +1151,15 @@ async def chat_completions_endpoint(request: ChatRequest):
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
         if request.stream:
-            # Tokenize for cache lookup (streaming)
-            add_special = (
-                not hasattr(processor, "chat_template")
-                if config.model_type in ["gemma3", "gemma3n", "gemma4"]
-                else True
-            )
-            stream_prompt_token_ids = tokenizer.encode(
-                formatted_prompt, add_special_tokens=add_special
+            # Compute message boundaries for cache lookup
+            stream_msg_ranges, stream_all_tokens = compute_message_token_ranges(
+                processor, config, processed_messages,
+                template_kwargs=template_kwargs,
             )
 
             # Cache lookup (streaming)
             stream_cache_store = get_prompt_cache_store(request.model)
-            stream_cached = stream_cache_store.get(stream_prompt_token_ids)
+            stream_cached = stream_cache_store.get(stream_msg_ranges, stream_all_tokens)
             if stream_cached is not None:
                 layer_states, num_cached_tokens = stream_cached
                 prompt_cache = stream_cache_store.reconstruct_cache(
@@ -1227,23 +1223,16 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
 
-                    # Store cache for future reuse (streaming)
+                    # Store cache at message boundaries (streaming)
                     if (
                         last_chunk is not None
                         and hasattr(last_chunk, "prompt_cache")
                         and last_chunk.prompt_cache is not None
                     ):
-                        stable_prompt = apply_chat_template(
-                            processor, config, processed_messages,
-                            num_images=len(images), num_audios=len(audio),
-                            add_generation_prompt=False,
-                            **template_kwargs,
-                        )
-                        stable_token_ids = tokenizer.encode(
-                            stable_prompt, add_special_tokens=add_special,
-                        )
                         stream_cache_store.put(
-                            stable_token_ids, last_chunk.prompt_cache
+                            stream_msg_ranges,
+                            stream_all_tokens,
+                            last_chunk.prompt_cache,
                         )
 
                     if tool_parser_type is not None:
@@ -1302,19 +1291,15 @@ async def chat_completions_endpoint(request: ChatRequest):
         else:
             # Non-streaming response
             try:
-                # Tokenize for cache lookup
-                add_special = (
-                    not hasattr(processor, "chat_template")
-                    if config.model_type in ["gemma3", "gemma3n", "gemma4"]
-                    else True
-                )
-                prompt_token_ids = tokenizer.encode(
-                    formatted_prompt, add_special_tokens=add_special
+                # Compute message boundaries for cache lookup
+                msg_ranges, all_token_ids = compute_message_token_ranges(
+                    processor, config, processed_messages,
+                    template_kwargs=template_kwargs,
                 )
 
-                # Cache lookup
+                # Cache lookup: find deepest cached message boundary
                 cache_store = get_prompt_cache_store(request.model)
-                cached = cache_store.get(prompt_token_ids)
+                cached = cache_store.get(msg_ranges, all_token_ids)
                 if cached is not None:
                     layer_states, num_cached_tokens = cached
                     prompt_cache = cache_store.reconstruct_cache(
@@ -1323,8 +1308,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                     generation_kwargs["prompt_cache"] = prompt_cache
                     logger.info(
                         "Cache hit: %d/%d tokens cached, prefilling %d remaining",
-                        num_cached_tokens, len(prompt_token_ids),
-                        len(prompt_token_ids) - num_cached_tokens,
+                        num_cached_tokens, len(all_token_ids),
+                        len(all_token_ids) - num_cached_tokens,
                     )
 
                 gen_result = generate(
@@ -1333,27 +1318,18 @@ async def chat_completions_endpoint(request: ChatRequest):
                     prompt=formatted_prompt,
                     image=images,
                     audio=audio,
-                    verbose=False,  # Keep API output clean
+                    verbose=False,
                     **generation_kwargs,
                 )
 
-                # Store cache keyed by stable prefix (conversation history
-                # without the generation prompt suffix, which changes between
-                # turns). The next request's prompt starts with this prefix.
+                # Store cache at each message boundary
                 if (
                     hasattr(gen_result, "prompt_cache")
                     and gen_result.prompt_cache is not None
                 ):
-                    stable_prompt = apply_chat_template(
-                        processor, config, processed_messages,
-                        num_images=len(images), num_audios=len(audio),
-                        add_generation_prompt=False,
-                        **template_kwargs,
+                    cache_store.put(
+                        msg_ranges, all_token_ids, gen_result.prompt_cache,
                     )
-                    stable_token_ids = tokenizer.encode(
-                        stable_prompt, add_special_tokens=add_special,
-                    )
-                    cache_store.put(stable_token_ids, gen_result.prompt_cache)
 
                 mx.clear_cache()
                 print("Generation finished.")
