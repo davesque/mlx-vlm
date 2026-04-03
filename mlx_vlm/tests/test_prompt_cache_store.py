@@ -132,3 +132,44 @@ class TestCacheReconstruction:
             # Verify data survived round-trip
             assert mx.allclose(k, mx.ones_like(k))
             assert mx.allclose(v, mx.ones_like(v) * 2)
+
+
+import tempfile
+from pathlib import Path
+
+
+class TestDiskPersistence:
+    def test_save_and_load_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+
+            # Create store, add data, save
+            store = PromptCacheStore(model_name="test")
+            tokens = list(range(2 * BLOCK_SIZE))
+            cache = _make_dummy_cache(num_layers=2, seq_len=2 * BLOCK_SIZE)
+            store.put(tokens, cache)
+            assert store.block_count == 2
+            store.save_to_disk(cache_dir)
+
+            # Create new store, load from disk
+            store2 = PromptCacheStore(model_name="test")
+            store2.load_from_disk(cache_dir)
+            assert store2.block_count == 2
+
+            # Verify lookup works after load
+            result = store2.get(tokens)
+            assert result is not None
+            _, n_tokens = result
+            assert n_tokens == 2 * BLOCK_SIZE
+
+    def test_save_empty_store(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            store = PromptCacheStore(model_name="test")
+            store.save_to_disk(cache_dir)
+            assert (cache_dir / "cache_index.json").exists()
+
+    def test_load_nonexistent_dir(self):
+        store = PromptCacheStore(model_name="test")
+        loaded = store.load_from_disk(Path("/nonexistent/path"))
+        assert loaded == 0
