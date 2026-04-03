@@ -109,8 +109,8 @@ def get_quantized_kv_start():
 async def lifespan(app):
     global _prompt_cache_dir
 
-    # Ensure cache logging is visible. Uvicorn may not set up a root
-    # handler, so third-party loggers have nowhere to send output.
+    # Configure logging for app modules. Uvicorn's log_level only affects
+    # its own loggers; app-level loggers need an explicit root handler.
     if not logging.root.handlers:
         logging.basicConfig(
             level=logging.INFO,
@@ -1559,6 +1559,7 @@ def main():
         port=args.port,
         workers=1,
         reload=args.reload,
+        log_level="info",
     )
 
 
