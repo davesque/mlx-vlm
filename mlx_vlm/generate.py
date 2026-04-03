@@ -495,6 +495,7 @@ def generate_step(
         # If we have a pre-populated cache, skip the cached prefix tokens.
         # The cache already has KV state for those positions.
         cached_token_count = kwargs.pop("cached_token_count", 0)
+        print(f"[generate_step] cached_token_count={cached_token_count}, inputs_embeds={inputs_embeds.shape[1]}, prompt_cache_offset={prompt_cache[0].offset if prompt_cache else 'N/A'}")
         if cached_token_count > 0 and inputs_embeds.shape[1] > cached_token_count:
             inputs_embeds = inputs_embeds[:, cached_token_count:]
             input_ids = input_ids[:, cached_token_count:]

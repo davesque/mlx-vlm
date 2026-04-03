@@ -1237,9 +1237,25 @@ async def chat_completions_endpoint(request: ChatRequest):
                         and hasattr(last_chunk, "prompt_cache")
                         and last_chunk.prompt_cache is not None
                     ):
+                        # Store boundaries for the input messages
                         stream_cache_store.put(
                             stream_msg_ranges,
                             stream_all_tokens,
+                            last_chunk.prompt_cache,
+                        )
+                        # Also store a boundary including the assistant's
+                        # response, so the NEXT request (which includes this
+                        # response in its history) gets a deeper cache hit.
+                        full_messages = list(processed_messages) + [
+                            {"role": "assistant", "content": output_text}
+                        ]
+                        full_ranges, full_tokens = compute_message_token_ranges(
+                            processor, config, full_messages,
+                            template_kwargs=template_kwargs,
+                        )
+                        stream_cache_store.put(
+                            full_ranges,
+                            full_tokens,
                             last_chunk.prompt_cache,
                         )
 
@@ -1339,6 +1355,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                 ):
                     cache_store.put(
                         msg_ranges, all_token_ids, gen_result.prompt_cache,
+                    )
+                    # Also store including assistant response for next turn
+                    full_messages = list(processed_messages) + [
+                        {"role": "assistant", "content": gen_result.text}
+                    ]
+                    full_ranges, full_tokens = compute_message_token_ranges(
+                        processor, config, full_messages,
+                        template_kwargs=template_kwargs,
+                    )
+                    cache_store.put(
+                        full_ranges, full_tokens, gen_result.prompt_cache,
                     )
 
                 mx.clear_cache()
