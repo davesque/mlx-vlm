@@ -1170,11 +1170,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                 live_cache, layer_states, num_cached_tokens = stream_cached
                 if live_cache is not None:
                     generation_kwargs["prompt_cache"] = live_cache
+                    generation_kwargs["cached_token_count"] = num_cached_tokens
                 else:
                     try:
                         generation_kwargs["prompt_cache"] = stream_cache_store.reconstruct_cache(
                             layer_states, trim_to=num_cached_tokens
                         )
+                        generation_kwargs["cached_token_count"] = num_cached_tokens
                     except Exception as e:
                         logger.warning("Cache: disk reconstruction failed (%s), falling back to full prefill", e)
 
@@ -1310,11 +1312,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                     live_cache, layer_states, num_cached_tokens = cached
                     if live_cache is not None:
                         generation_kwargs["prompt_cache"] = live_cache
+                        generation_kwargs["cached_token_count"] = num_cached_tokens
                     else:
                         try:
                             generation_kwargs["prompt_cache"] = cache_store.reconstruct_cache(
                                 layer_states, trim_to=num_cached_tokens
                             )
+                            generation_kwargs["cached_token_count"] = num_cached_tokens
                         except Exception as e:
                             logger.warning("Cache: disk reconstruction failed (%s), falling back to full prefill", e)
 

@@ -491,6 +491,14 @@ def generate_step(
                 if k != "inputs_embeds" and v is not None
             }
         )
+
+        # If we have a pre-populated cache, skip the cached prefix tokens.
+        # The cache already has KV state for those positions.
+        cached_token_count = kwargs.pop("cached_token_count", 0)
+        if cached_token_count > 0 and inputs_embeds.shape[1] > cached_token_count:
+            inputs_embeds = inputs_embeds[:, cached_token_count:]
+            input_ids = input_ids[:, cached_token_count:]
+
         if getattr(model, "no_chunked_prefill", False):
             prefill_step_size = None
         if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
