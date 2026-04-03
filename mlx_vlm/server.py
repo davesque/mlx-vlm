@@ -8,6 +8,7 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, List, Literal, Optional, Union
 
 import mlx.core as mx
@@ -35,6 +36,7 @@ from .generate import (
     normalize_resize_shape,
     stream_generate,
 )
+from .prompt_cache_store import PromptCacheStore
 from .prompt_utils import apply_chat_template
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
@@ -42,6 +44,22 @@ from .version import __version__
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+
+# Prompt cache store (initialized per model)
+_prompt_cache_stores: dict[str, PromptCacheStore] = {}
+_prompt_cache_dir: Optional[Path] = None
+
+
+def get_prompt_cache_store(model_name: str) -> PromptCacheStore:
+    """Get or create a prompt cache store for the given model."""
+    if model_name not in _prompt_cache_stores:
+        store = PromptCacheStore(model_name=model_name)
+        if _prompt_cache_dir is not None:
+            model_cache_dir = _prompt_cache_dir / model_name.replace("/", "_")
+            if model_cache_dir.exists():
+                store.load_from_disk(model_cache_dir)
+        _prompt_cache_stores[model_name] = store
+    return _prompt_cache_stores[model_name]
 
 
 def get_prefill_step_size():
@@ -86,6 +104,11 @@ def get_quantized_kv_start():
 
 @asynccontextmanager
 async def lifespan(app):
+    global _prompt_cache_dir
+    _prompt_cache_dir = Path(
+        os.environ.get("PROMPT_CACHE_DIR", os.path.expanduser("~/.mlx_vlm/cache"))
+    )
+
     # Startup
     model_path = os.environ.get("PRELOAD_MODEL")
     adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
@@ -97,6 +120,15 @@ async def lifespan(app):
             print(f"Failed to preload model: {e}")
             print("Server will continue without a preloaded model.")
     yield
+
+    # Save prompt caches to disk on shutdown
+    if _prompt_cache_dir is not None:
+        for model_name, store in _prompt_cache_stores.items():
+            if store.block_count > 0:
+                model_cache_dir = _prompt_cache_dir / model_name.replace("/", "_")
+                print(f"Saving prompt cache for {model_name} to {model_cache_dir}...")
+                store.save_to_disk(model_cache_dir)
+
     unload_model_sync()
 
 
@@ -1111,9 +1143,34 @@ async def chat_completions_endpoint(request: ChatRequest):
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
         if request.stream:
+            # Tokenize for cache lookup (streaming)
+            add_special = (
+                not hasattr(processor, "chat_template")
+                if config.model_type in ["gemma3", "gemma3n", "gemma4"]
+                else True
+            )
+            stream_prompt_token_ids = tokenizer.encode(
+                formatted_prompt, add_special_tokens=add_special
+            )
+
+            # Cache lookup (streaming)
+            stream_cache_store = get_prompt_cache_store(request.model)
+            stream_cached = stream_cache_store.get(stream_prompt_token_ids)
+            if stream_cached is not None:
+                layer_states, num_cached_tokens = stream_cached
+                prompt_cache = stream_cache_store.reconstruct_cache(layer_states)
+                generation_kwargs["prompt_cache"] = prompt_cache
+                print(
+                    f"Cache hit (stream): {num_cached_tokens}/"
+                    f"{len(stream_prompt_token_ids)} tokens cached, "
+                    f"prefilling "
+                    f"{len(stream_prompt_token_ids) - num_cached_tokens} remaining"
+                )
+
             # Streaming response
             async def stream_generator():
                 token_iterator = None
+                last_chunk = None
                 try:
                     # Use stream_generate from utils
                     token_iterator = stream_generate(
@@ -1132,6 +1189,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
 
+                        last_chunk = chunk
                         output_text += chunk.text
 
                         # Yield chunks in Server-Sent Events (SSE) format
@@ -1159,6 +1217,20 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                    # Store cache for future reuse (streaming)
+                    if (
+                        last_chunk is not None
+                        and hasattr(last_chunk, "prompt_cache")
+                        and last_chunk.prompt_cache is not None
+                    ):
+                        output_token_ids = tokenizer.encode(
+                            output_text, add_special_tokens=False
+                        )
+                        all_token_ids = stream_prompt_token_ids + output_token_ids
+                        stream_cache_store.put(
+                            all_token_ids, last_chunk.prompt_cache
+                        )
 
                     if tool_parser_type is not None:
                         tool_calls = process_tool_calls(
@@ -1201,8 +1273,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                 finally:
                     mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
+                    print("Stream finished.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1217,7 +1288,29 @@ async def chat_completions_endpoint(request: ChatRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
+                # Tokenize for cache lookup
+                add_special = (
+                    not hasattr(processor, "chat_template")
+                    if config.model_type in ["gemma3", "gemma3n", "gemma4"]
+                    else True
+                )
+                prompt_token_ids = tokenizer.encode(
+                    formatted_prompt, add_special_tokens=add_special
+                )
+
+                # Cache lookup
+                cache_store = get_prompt_cache_store(request.model)
+                cached = cache_store.get(prompt_token_ids)
+                if cached is not None:
+                    layer_states, num_cached_tokens = cached
+                    prompt_cache = cache_store.reconstruct_cache(layer_states)
+                    generation_kwargs["prompt_cache"] = prompt_cache
+                    print(
+                        f"Cache hit: {num_cached_tokens}/{len(prompt_token_ids)} "
+                        f"tokens cached, prefilling "
+                        f"{len(prompt_token_ids) - num_cached_tokens} remaining"
+                    )
+
                 gen_result = generate(
                     model=model,
                     processor=processor,
@@ -1227,10 +1320,20 @@ async def chat_completions_endpoint(request: ChatRequest):
                     verbose=False,  # Keep API output clean
                     **generation_kwargs,
                 )
-                # Clean up resources
+
+                # Store cache for future reuse
+                if (
+                    hasattr(gen_result, "prompt_cache")
+                    and gen_result.prompt_cache is not None
+                ):
+                    output_token_ids = tokenizer.encode(
+                        gen_result.text, add_special_tokens=False
+                    )
+                    all_token_ids = prompt_token_ids + output_token_ids
+                    cache_store.put(all_token_ids, gen_result.prompt_cache)
+
                 mx.clear_cache()
-                gc.collect()
-                print("Generation finished, cleared cache.")
+                print("Generation finished.")
 
                 usage_stats = UsageStats(
                     input_tokens=gen_result.prompt_tokens,
@@ -1273,7 +1376,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                 print(f"Error during generation: {e}")
                 traceback.print_exc()
                 mx.clear_cache()
-                gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     except HTTPException as http_exc:
@@ -1284,7 +1386,6 @@ async def chat_completions_endpoint(request: ChatRequest):
         print(f"Unexpected error in /generate endpoint: {e}")
         traceback.print_exc()
         mx.clear_cache()
-        gc.collect()
         raise HTTPException(
             status_code=500, detail=f"An unexpected error occurred: {e}"
         )

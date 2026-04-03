@@ -335,6 +335,7 @@ class GenerationResult:
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     peak_memory: float = 0.0
+    prompt_cache: Optional[list] = None
 
 
 def generate_step(
@@ -635,6 +636,15 @@ def stream_generate(
     else:
         tokenizer.thinking_budget_criteria = None
 
+    # Create or reuse prompt_cache so we can return it after generation
+    prompt_cache = kwargs.pop("prompt_cache", None)
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(
+            model.language_model,
+            max_kv_size=kwargs.get("max_kv_size"),
+        )
+    kwargs["prompt_cache"] = prompt_cache
+
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
@@ -682,6 +692,7 @@ def stream_generate(
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
+            prompt_cache=prompt_cache,
         )
 
         # Cleanup after generation
@@ -795,6 +806,7 @@ def generate(
         prompt_tps=last_response.prompt_tps,
         generation_tps=last_response.generation_tps,
         peak_memory=last_response.peak_memory,
+        prompt_cache=last_response.prompt_cache,
     )
 
 
