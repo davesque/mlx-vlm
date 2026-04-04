@@ -1105,6 +1105,8 @@ async def chat_completions_endpoint(request: ChatRequest):
     """
 
     try:
+        logger.info("Chat request: %d messages", len(request.messages))
+
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(request.model, request.adapter_path)
 
@@ -1165,13 +1167,23 @@ async def chat_completions_endpoint(request: ChatRequest):
             stream_msg_ranges, stream_all_tokens = compute_message_token_ranges(
                 processor, config, processed_messages,
                 template_kwargs=template_kwargs,
+                tools=tools,
             )
+
+            total_tokens = len(stream_all_tokens)
 
             # Cache lookup (streaming)
             stream_cache_store = get_prompt_cache_store(request.model)
             stream_cached = stream_cache_store.get(stream_msg_ranges, stream_all_tokens)
             if stream_cached is not None:
                 live_cache, layer_states, num_cached_tokens = stream_cached
+                prefill_tokens = total_tokens - num_cached_tokens
+                logger.info(
+                    "Cache HIT: %d cached, %d to prefill (%.0f%% saved), source=%s",
+                    num_cached_tokens, prefill_tokens,
+                    100 * num_cached_tokens / total_tokens if total_tokens else 0,
+                    "memory" if live_cache is not None else "disk",
+                )
                 if live_cache is not None:
                     generation_kwargs["prompt_cache"] = live_cache
                     generation_kwargs["cached_token_count"] = num_cached_tokens
@@ -1181,6 +1193,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                     )
                     generation_kwargs["prompt_cache"] = reconstructed
                     generation_kwargs["cached_token_count"] = num_cached_tokens
+            else:
+                logger.info("Cache MISS: will prefill all %d tokens", total_tokens)
 
             # Streaming response
             async def stream_generator():
@@ -1254,6 +1268,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         full_ranges, full_tokens = compute_message_token_ranges(
                             processor, config, full_messages,
                             template_kwargs=template_kwargs,
+                            tools=tools,
                         )
                         stream_cache_store.put(
                             full_ranges,
@@ -1321,6 +1336,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 msg_ranges, all_token_ids = compute_message_token_ranges(
                     processor, config, processed_messages,
                     template_kwargs=template_kwargs,
+                    tools=tools,
                 )
 
                 # Cache lookup: find deepest cached message boundary
@@ -1363,6 +1379,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     full_ranges, full_tokens = compute_message_token_ranges(
                         processor, config, full_messages,
                         template_kwargs=template_kwargs,
+                        tools=tools,
                     )
                     cache_store.put(
                         full_ranges, full_tokens, gen_result.prompt_cache,

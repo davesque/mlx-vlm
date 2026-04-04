@@ -427,6 +427,7 @@ def compute_message_token_ranges(
     config,
     messages: list[dict],
     template_kwargs: Optional[dict] = None,
+    tools: Optional[list] = None,
 ) -> tuple[list[tuple[int, int]], list[int]]:
     """Compute token ranges for each message boundary.
 
@@ -438,6 +439,9 @@ def compute_message_token_ranges(
         config: Model config (for add_special_tokens logic).
         messages: List of {"role": ..., "content": ...} dicts.
         template_kwargs: Extra kwargs for apply_chat_template.
+        tools: Tool definitions to include in the prompt (must match
+            what is passed to the formatted_prompt for token counts
+            to agree).
 
     Returns:
         (message_token_ranges, all_token_ids) where ranges is a list
@@ -463,6 +467,7 @@ def compute_message_token_ranges(
         prefix_text = apply_chat_template(
             processor, config, prefix_messages,
             add_generation_prompt=False,
+            tools=tools,
             **tkw,
         )
         prefix_tokens = tokenizer.encode(prefix_text, add_special_tokens=add_special)
@@ -474,6 +479,7 @@ def compute_message_token_ranges(
     full_text = apply_chat_template(
         processor, config, messages,
         add_generation_prompt=True,
+        tools=tools,
         **tkw,
     )
     all_token_ids = tokenizer.encode(full_text, add_special_tokens=add_special)

@@ -3,6 +3,7 @@ import codecs
 import contextlib
 import functools
 import json
+import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+
+logger = logging.getLogger(__name__)
 from mlx.utils import tree_reduce
 from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
@@ -495,9 +498,19 @@ def generate_step(
         # If we have a pre-populated cache, skip the cached prefix tokens.
         # The cache already has KV state for those positions.
         cached_token_count = kwargs.pop("cached_token_count", 0)
-        if cached_token_count > 0 and inputs_embeds.shape[1] > cached_token_count:
+        total_embed_tokens = inputs_embeds.shape[1]
+        if cached_token_count > 0 and total_embed_tokens > cached_token_count:
             inputs_embeds = inputs_embeds[:, cached_token_count:]
             input_ids = input_ids[:, cached_token_count:]
+            logger.info(
+                "generate_step: trimmed %d cached tokens, prefilling %d of %d total",
+                cached_token_count, inputs_embeds.shape[1], total_embed_tokens,
+            )
+        elif cached_token_count > 0:
+            logger.warning(
+                "generate_step: cached_token_count=%d but embeds only %d, NOT trimming",
+                cached_token_count, total_embed_tokens,
+            )
 
         if getattr(model, "no_chunked_prefill", False):
             prefill_step_size = None
