@@ -258,19 +258,25 @@ class PromptCacheStore:
 
         result = []
         for i, state in enumerate(layer_states):
-            if cache_template and i < len(cache_template):
-                cache_obj = cache_template[i]
-            elif _is_turboquant_state(state):
+            if _is_turboquant_state(state):
+                # TurboQuant states need their own cache type regardless
+                # of template (template has plain KVCache for these layers)
                 cache_obj = _make_turboquant_cache(
                     state,
                     bits=self._tq_bits,
                     seed=self._tq_seed,
                 )
+            elif cache_template and i < len(cache_template):
+                cache_obj = cache_template[i]
             else:
                 cache_obj = KVCache()
 
             if trim_to is not None and state is not None:
                 state = _trim_state(state, trim_to)
+
+            # ArraysCache expects a list, not a tuple
+            if isinstance(state, tuple) and hasattr(cache_obj, "cache"):
+                state = list(state)
 
             cache_obj.state = state
             result.append(cache_obj)
@@ -464,12 +470,17 @@ def compute_message_token_ranges(
 
     for i in range(1, len(messages) + 1):
         prefix_messages = messages[:i]
-        prefix_text = apply_chat_template(
-            processor, config, prefix_messages,
-            add_generation_prompt=False,
-            tools=tools,
-            **tkw,
-        )
+        try:
+            prefix_text = apply_chat_template(
+                processor, config, prefix_messages,
+                add_generation_prompt=False,
+                tools=tools,
+                **tkw,
+            )
+        except Exception:
+            # Some templates (e.g. Qwen 3.5) require a user message.
+            # Skip this prefix and merge its tokens into the next boundary.
+            continue
         prefix_tokens = tokenizer.encode(prefix_text, add_special_tokens=add_special)
         end = len(prefix_tokens)
         ranges.append((prev_end, end))

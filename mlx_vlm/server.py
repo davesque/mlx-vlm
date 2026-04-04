@@ -1188,8 +1188,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                     generation_kwargs["prompt_cache"] = live_cache
                     generation_kwargs["cached_token_count"] = num_cached_tokens
                 elif layer_states:
+                    from mlx_lm.models import cache as cache_mod
+                    _cache_model = getattr(model, "language_model", model)
+                    cache_template = cache_mod.make_prompt_cache(_cache_model)
                     reconstructed = stream_cache_store.reconstruct_cache(
                         layer_states, trim_to=num_cached_tokens,
+                        cache_template=cache_template,
                     )
                     generation_kwargs["prompt_cache"] = reconstructed
                     generation_kwargs["cached_token_count"] = num_cached_tokens
@@ -1348,8 +1352,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                         generation_kwargs["prompt_cache"] = live_cache
                         generation_kwargs["cached_token_count"] = num_cached_tokens
                     elif layer_states:
+                        from mlx_lm.models import cache as cache_mod
+                        cache_template = cache_mod.make_prompt_cache(model)
                         reconstructed = cache_store.reconstruct_cache(
                             layer_states, trim_to=num_cached_tokens,
+                            cache_template=cache_template,
                         )
                         generation_kwargs["prompt_cache"] = reconstructed
                         generation_kwargs["cached_token_count"] = num_cached_tokens
