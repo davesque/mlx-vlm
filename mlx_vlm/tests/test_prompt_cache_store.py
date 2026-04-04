@@ -4,6 +4,7 @@ from pathlib import Path
 import mlx.core as mx
 from mlx_lm.models.cache import KVCache
 from mlx_vlm.prompt_cache_store import PromptCacheStore, compute_chain_hash
+from mlx_vlm.turboquant import TurboQuantKVCache, TurboQuantMSEState, TurboQuantProdState
 
 
 def _make_dummy_cache(num_layers: int = 2, seq_len: int = 100) -> list:
@@ -211,3 +212,148 @@ class TestDiskPersistence:
         store = PromptCacheStore(model_name="test")
         loaded = store.load_from_disk(Path("/nonexistent/path"))
         assert loaded == 0
+
+
+def _make_turboquant_cache(num_layers: int = 2, seq_len: int = 50, bits: float = 3.5):
+    """Create a TurboQuantKVCache list with quantized state for testing.
+
+    Uses real TurboQuantKVCache.update_and_fetch to produce authentic
+    quantized states (TurboQuantProdState keys, TurboQuantMSEState values).
+    """
+    caches = []
+    for _ in range(num_layers):
+        tq = TurboQuantKVCache(bits=bits)
+        # Feed random data through quantization to get real TQ state
+        keys = mx.random.normal((1, 4, seq_len, 64))
+        values = mx.random.normal((1, 4, seq_len, 64))
+        tq.update_and_fetch(keys, values)
+        mx.eval(tq.keys, tq.values)  # noqa: S307 - mx.eval materializes lazy MLX arrays
+        caches.append(tq)
+    return caches
+
+
+class TestTurboQuantDiskPersistence:
+    """Tests for TurboQuant KV cache disk round-trip."""
+
+    def test_state_setter_preserves_offset(self):
+        """Setting state on a fresh TurboQuantKVCache restores the offset."""
+        cache = _make_turboquant_cache(num_layers=1, seq_len=100)[0]
+        assert cache.offset == 100
+
+        keys_state, values_state = cache.state
+        assert isinstance(keys_state, TurboQuantProdState)
+        assert isinstance(values_state, TurboQuantMSEState)
+
+        # Create a fresh cache and restore state
+        fresh = TurboQuantKVCache(bits=3.5)
+        fresh.state = (keys_state, values_state)
+        assert fresh.offset == 100
+
+    def test_store_detects_tq_params(self):
+        """put() auto-detects bits and seed from TurboQuantKVCache objects."""
+        store = PromptCacheStore(model_name="test")
+        cache = _make_turboquant_cache(num_layers=2, seq_len=50)
+        ranges = [(0, 50)]
+        tokens = list(range(50))
+        store.put(ranges, tokens, cache)
+
+        assert store._tq_bits == 3.5
+        assert store._tq_seed is not None
+
+    def test_disk_round_trip_preserves_state(self):
+        """TurboQuant states survive save/load from disk."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+
+            # Create store with TQ cache
+            store = PromptCacheStore(model_name="test")
+            cache = _make_turboquant_cache(num_layers=2, seq_len=50)
+            ranges = [(0, 20), (20, 50)]
+            tokens = list(range(50))
+            store.put(ranges, tokens, cache)
+
+            # Snapshot original state for comparison
+            original_states = [c.state for c in cache]
+
+            # Save to disk
+            store.save_to_disk(cache_dir)
+
+            # Load into a fresh store
+            store2 = PromptCacheStore(model_name="test")
+            loaded = store2.load_from_disk(cache_dir)
+            assert loaded > 0
+
+            # TQ params should be restored
+            assert store2._tq_bits == 3.5
+
+            # Lookup should succeed
+            result = store2.get(ranges, tokens)
+            assert result is not None
+            live_cache, layer_states, n_tokens = result
+            assert live_cache is None  # disk-loaded, no live objects
+            assert n_tokens == 50
+
+            # Reconstruct and verify state matches
+            reconstructed = store2.reconstruct_cache(layer_states)
+            assert len(reconstructed) == 2
+
+            for i, rc in enumerate(reconstructed):
+                assert isinstance(rc, TurboQuantKVCache)
+                assert rc.offset == 50
+
+                orig_k, orig_v = original_states[i]
+                recon_k, recon_v = rc.state
+
+                # Verify NamedTuple types preserved
+                assert isinstance(recon_k, TurboQuantProdState)
+                assert isinstance(recon_v, TurboQuantMSEState)
+
+                # Verify array values match
+                assert mx.allclose(recon_k.norms, orig_k.norms)
+                assert mx.allclose(recon_v.norms, orig_v.norms)
+
+    def test_reconstructed_cache_can_accept_new_tokens(self):
+        """Reconstructed TQ cache can process new tokens via update_and_fetch."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+
+            store = PromptCacheStore(model_name="test")
+            cache = _make_turboquant_cache(num_layers=1, seq_len=50)
+            ranges = [(0, 50)]
+            tokens = list(range(50))
+            store.put(ranges, tokens, cache)
+            store.save_to_disk(cache_dir)
+
+            # Load and reconstruct
+            store2 = PromptCacheStore(model_name="test")
+            store2.load_from_disk(cache_dir)
+            result = store2.get(ranges, tokens)
+            _, layer_states, n_tokens = result
+
+            reconstructed = store2.reconstruct_cache(layer_states)
+            rc = reconstructed[0]
+            assert rc.offset == 50
+
+            # Append a new token (simulates generation)
+            new_key = mx.random.normal((1, 4, 1, 64))
+            new_val = mx.random.normal((1, 4, 1, 64))
+            rc.update_and_fetch(new_key, new_val)
+            assert rc.offset == 51
+
+    def test_disk_round_trip_tq_params_in_index(self):
+        """TQ bits and seed are saved in cache_index.json."""
+        import json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+
+            store = PromptCacheStore(model_name="test")
+            cache = _make_turboquant_cache(num_layers=1, seq_len=10)
+            store.put([(0, 10)], list(range(10)), cache)
+            store.save_to_disk(cache_dir)
+
+            with open(cache_dir / "cache_index.json") as f:
+                index = json.load(f)
+
+            assert index["tq_bits"] == 3.5
+            assert "tq_seed" in index

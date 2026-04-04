@@ -135,10 +135,17 @@ async def lifespan(app):
             print("Server will continue without a preloaded model.")
     yield
 
-    # TODO: Disk persistence is disabled for now because TurboQuant
-    # cache states can't be reconstructed from disk (requires codec
-    # re-initialization). Re-enable once plain KVCache detection or
-    # TurboQuant codec serialization is implemented.
+    # Save prompt caches to disk on shutdown
+    for model_name, store in _prompt_cache_stores.items():
+        if store.entry_count > 0 and _prompt_cache_dir is not None:
+            model_cache_dir = _prompt_cache_dir / model_name.replace("/", "_")
+            try:
+                saved = store.save_to_disk(model_cache_dir)
+                logger.info(
+                    "Saved %d cache entries for %s", saved, model_name,
+                )
+            except Exception as e:
+                logger.warning("Failed to save cache for %s: %s", model_name, e)
 
     unload_model_sync()
 
@@ -1168,6 +1175,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                 if live_cache is not None:
                     generation_kwargs["prompt_cache"] = live_cache
                     generation_kwargs["cached_token_count"] = num_cached_tokens
+                elif layer_states:
+                    reconstructed = stream_cache_store.reconstruct_cache(
+                        layer_states, trim_to=num_cached_tokens,
+                    )
+                    generation_kwargs["prompt_cache"] = reconstructed
+                    generation_kwargs["cached_token_count"] = num_cached_tokens
 
             # Streaming response
             async def stream_generator():
@@ -1317,6 +1330,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                     live_cache, layer_states, num_cached_tokens = cached
                     if live_cache is not None:
                         generation_kwargs["prompt_cache"] = live_cache
+                        generation_kwargs["cached_token_count"] = num_cached_tokens
+                    elif layer_states:
+                        reconstructed = cache_store.reconstruct_cache(
+                            layer_states, trim_to=num_cached_tokens,
+                        )
+                        generation_kwargs["prompt_cache"] = reconstructed
                         generation_kwargs["cached_token_count"] = num_cached_tokens
 
                 gen_result = generate(

@@ -89,6 +89,9 @@ class PromptCacheStore:
         self.max_entries = max_entries
         # chain_hash -> _CacheEntry
         self._entries: OrderedDict[bytes, _CacheEntry] = OrderedDict()
+        # TurboQuant parameters (auto-detected from first put)
+        self._tq_bits: Optional[float] = None
+        self._tq_seed: Optional[int] = None
 
     def put(
         self,
@@ -109,6 +112,14 @@ class PromptCacheStore:
         """
         if not message_token_ranges or not all_token_ids:
             return 0
+
+        # Auto-detect TurboQuant parameters from the prompt_cache objects
+        if self._tq_bits is None and prompt_cache:
+            for cache_obj in prompt_cache:
+                if hasattr(cache_obj, "bits") and hasattr(cache_obj, "seed"):
+                    self._tq_bits = cache_obj.bits
+                    self._tq_seed = cache_obj.seed
+                    break
 
         stored = 0
         parent_hash = None
@@ -250,7 +261,11 @@ class PromptCacheStore:
             if cache_template and i < len(cache_template):
                 cache_obj = cache_template[i]
             elif _is_turboquant_state(state):
-                cache_obj = _make_turboquant_cache(state)
+                cache_obj = _make_turboquant_cache(
+                    state,
+                    bits=self._tq_bits,
+                    seed=self._tq_seed,
+                )
             else:
                 cache_obj = KVCache()
 
@@ -275,6 +290,10 @@ class PromptCacheStore:
             "model_name": self.model_name,
             "entries": [],
         }
+        if self._tq_bits is not None:
+            index["tq_bits"] = self._tq_bits
+        if self._tq_seed is not None:
+            index["tq_seed"] = self._tq_seed
         saved = 0
 
         for chain_hash, entry in self._entries.items():
@@ -327,6 +346,12 @@ class PromptCacheStore:
             )
             return 0
 
+        # Restore TurboQuant parameters
+        if "tq_bits" in index:
+            self._tq_bits = index["tq_bits"]
+        if "tq_seed" in index:
+            self._tq_seed = index["tq_seed"]
+
         loaded = 0
         for entry_info in index["entries"]:
             hex_hash = entry_info["hash"]
@@ -376,21 +401,24 @@ def _is_turboquant_state(state) -> bool:
     return hasattr(keys, '_fields') and 'norms' in getattr(keys, '_fields', ())
 
 
-def _make_turboquant_cache(state):
-    """Create a TurboQuantKVCache and set its state directly.
+def _make_turboquant_cache(state, bits=None, seed=None):
+    """Create a TurboQuantKVCache for reconstructing from stored state.
 
     TurboQuantKVCache.state setter expects (keys_namedtuple, values_namedtuple)
-    and handles the offset calculation internally.
+    and handles the offset calculation internally. Codecs are not needed here;
+    they rebuild deterministically on the first update_and_fetch call.
     """
     try:
-        from mlx_vlm.turboquant import TurboQuantKVCache
-        # Infer bits from the stored state. The key codec uses floor(bits)
-        # and the value codec uses ceil(bits). We can't perfectly recover
-        # the original bits from state alone, so default to 3.5.
-        cache = TurboQuantKVCache(bits=3.5)
-        return cache
+        from mlx_vlm.turboquant import DEFAULT_TURBOQUANT_SEED, TurboQuantKVCache
+
+        if bits is None:
+            bits = 3.5
+        if seed is None:
+            seed = DEFAULT_TURBOQUANT_SEED
+        return TurboQuantKVCache(bits=bits, seed=seed)
     except ImportError:
         from mlx_lm.models.cache import KVCache
+
         return KVCache()
 
 
