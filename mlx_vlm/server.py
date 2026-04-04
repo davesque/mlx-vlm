@@ -56,7 +56,13 @@ _prompt_cache_dir: Optional[Path] = None
 def get_prompt_cache_store(model_name: str) -> PromptCacheStore:
     """Get or create a prompt cache store for the given model."""
     if model_name not in _prompt_cache_stores:
-        store = PromptCacheStore(model_name=model_name)
+        kv_bits = get_quantized_kv_bits(model_name)
+        kv_quant_scheme = get_kv_quant_scheme()
+        store = PromptCacheStore(
+            model_name=model_name,
+            kv_bits=kv_bits,
+            kv_quant_scheme=kv_quant_scheme,
+        )
         if _prompt_cache_dir is not None:
             model_cache_dir = _prompt_cache_dir / model_name.replace("/", "_")
             if model_cache_dir.exists():

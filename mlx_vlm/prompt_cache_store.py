@@ -84,9 +84,14 @@ class PromptCacheStore:
         self,
         model_name: str = "",
         max_entries: int = 128,
+        kv_bits: Optional[float] = None,
+        kv_quant_scheme: Optional[str] = None,
     ):
         self.model_name = model_name
         self.max_entries = max_entries
+        # KV cache configuration (used to reject incompatible disk caches)
+        self.kv_bits = kv_bits
+        self.kv_quant_scheme = kv_quant_scheme
         # chain_hash -> _CacheEntry
         self._entries: OrderedDict[bytes, _CacheEntry] = OrderedDict()
         # TurboQuant parameters (auto-detected from first put)
@@ -294,6 +299,8 @@ class PromptCacheStore:
         cache_dir.mkdir(parents=True, exist_ok=True)
         index = {
             "model_name": self.model_name,
+            "kv_bits": self.kv_bits,
+            "kv_quant_scheme": self.kv_quant_scheme,
             "entries": [],
         }
         if self._tq_bits is not None:
@@ -349,6 +356,18 @@ class PromptCacheStore:
             logger.warning(
                 "Cache: model mismatch (disk=%s, current=%s), skipping",
                 index.get("model_name"), self.model_name,
+            )
+            return 0
+
+        # Reject cache if KV config doesn't match
+        disk_kv_bits = index.get("kv_bits")
+        disk_kv_scheme = index.get("kv_quant_scheme")
+        if disk_kv_bits != self.kv_bits or disk_kv_scheme != self.kv_quant_scheme:
+            logger.warning(
+                "Cache: KV config mismatch (disk: bits=%s scheme=%s, "
+                "current: bits=%s scheme=%s), skipping",
+                disk_kv_bits, disk_kv_scheme,
+                self.kv_bits, self.kv_quant_scheme,
             )
             return 0
 
