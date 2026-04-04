@@ -35,6 +35,26 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 
+def compute_model_fingerprint(model_path: str) -> Optional[str]:
+    """Compute a fast fingerprint from model file metadata (no content reads).
+
+    Hashes (filename, size, mtime_ns) for all safetensor files. This
+    catches re-downloads, re-quantizations, and model swaps without
+    reading any file content.
+    """
+    model_dir = Path(model_path)
+    if not model_dir.is_dir():
+        return None
+    safetensors = sorted(model_dir.glob("*.safetensors"))
+    if not safetensors:
+        return None
+    hasher = hashlib.sha256()
+    for f in safetensors:
+        st = f.stat()
+        hasher.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())
+    return hasher.hexdigest()[:16]
+
+
 def compute_chain_hash(
     parent_hash: Optional[bytes],
     token_ids: List[int],
@@ -86,12 +106,20 @@ class PromptCacheStore:
         max_entries: int = 128,
         kv_bits: Optional[float] = None,
         kv_quant_scheme: Optional[str] = None,
+        kv_group_size: Optional[int] = None,
+        quantized_kv_start: Optional[int] = None,
+        max_kv_size: Optional[int] = None,
+        model_fingerprint: Optional[str] = None,
     ):
         self.model_name = model_name
         self.max_entries = max_entries
         # KV cache configuration (used to reject incompatible disk caches)
         self.kv_bits = kv_bits
         self.kv_quant_scheme = kv_quant_scheme
+        self.kv_group_size = kv_group_size
+        self.quantized_kv_start = quantized_kv_start
+        self.max_kv_size = max_kv_size
+        self.model_fingerprint = model_fingerprint
         # chain_hash -> _CacheEntry
         self._entries: OrderedDict[bytes, _CacheEntry] = OrderedDict()
         # TurboQuant parameters (auto-detected from first put)
@@ -301,6 +329,10 @@ class PromptCacheStore:
             "model_name": self.model_name,
             "kv_bits": self.kv_bits,
             "kv_quant_scheme": self.kv_quant_scheme,
+            "kv_group_size": self.kv_group_size,
+            "quantized_kv_start": self.quantized_kv_start,
+            "max_kv_size": self.max_kv_size,
+            "model_fingerprint": self.model_fingerprint,
             "entries": [],
         }
         if self._tq_bits is not None:
@@ -359,16 +391,22 @@ class PromptCacheStore:
             )
             return 0
 
-        # Reject cache if KV config doesn't match
-        disk_kv_bits = index.get("kv_bits")
-        disk_kv_scheme = index.get("kv_quant_scheme")
-        if disk_kv_bits != self.kv_bits or disk_kv_scheme != self.kv_quant_scheme:
-            logger.warning(
-                "Cache: KV config mismatch (disk: bits=%s scheme=%s, "
-                "current: bits=%s scheme=%s), skipping",
-                disk_kv_bits, disk_kv_scheme,
-                self.kv_bits, self.kv_quant_scheme,
+        # Reject cache if config doesn't match
+        config_keys = [
+            "kv_bits", "kv_quant_scheme", "kv_group_size",
+            "quantized_kv_start", "max_kv_size", "model_fingerprint",
+        ]
+        mismatches = {}
+        for key in config_keys:
+            disk_val = index.get(key)
+            current_val = getattr(self, key)
+            if disk_val != current_val:
+                mismatches[key] = (disk_val, current_val)
+        if mismatches:
+            details = ", ".join(
+                f"{k}: disk={d} current={c}" for k, (d, c) in mismatches.items()
             )
+            logger.warning("Cache: config mismatch (%s), skipping", details)
             return 0
 
         # Restore TurboQuant parameters
